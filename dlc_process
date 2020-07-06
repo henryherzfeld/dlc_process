@@ -1,0 +1,279 @@
+#! /usr/bin/env python
+import sys
+import argparse
+import pathlib
+import os
+import pandas as pd
+import numpy as np
+from datetime import date
+from scipy.spatial import distance
+from scipy.stats import zscore, describe
+
+parser = argparse.ArgumentParser()
+
+parser.add_argument('input', type=str, help="the path to the directory containing input csvs")
+parser.add_argument('-o', '--output', type=str, help="the path to the directory where csvs will be output, output_ID if not specified")
+parser.add_argument('-v', '--verbose', action="store_true", help="display debug")
+parser.add_argument('-m', '--multiple', action="store_true", help="specify multiple csv to process")
+parser.add_argument('-c', '--concatenate', action="store_true", help="concatenate all dataframes")
+parser.add_argument('-d', '--drop', action="store_true", help="drop coords and liklihood columns from dataframe(s)")
+parser.add_argument('-f', '--flatten', action="store_true", help="flatten dataframe(s)")
+parser.add_argument('-p', '--pupil', action="store_true", help="add pupil diameter to dataframe(s)")
+parser.add_argument('-z', '--zscore', action="store_true", help="zscore normalization of pupil diameter")
+parser.add_argument('-s', '--seconds', action="store_true", help="interpolation of time scale from frames to seconds in dataframe(s)")
+parser.add_argument('-i', '--id', action="store_true", help="add id columns to dataframe(s)")
+
+args = parser.parse_args()
+
+def main() -> None:
+    print("processing started")
+
+    if pathlib.Path(args.input).is_dir() and not args.multiple:
+        print("override processing in multiple mode as a directory was specified...\n")
+        args.multiple = True
+
+    path = pathlib.PurePath(args.input)
+    data = {}
+
+    print("reading in data...")
+
+    if args.multiple:
+        files = os.listdir(path)
+
+        csvs = [file for file in files if file.endswith(".csv")]
+        n = len(csvs)
+
+        ids = [csv[0:3] for csv in csvs]
+
+        for i, zip_ in enumerate(zip(ids, csvs)):
+            id, csv = zip_
+            if args.verbose: print(f"processing csv {i+1}/{n}...\n")
+            df = pd.read_csv(os.path.join(path, csv), header=2, dtype=np.double)
+            data[id] = df
+
+    else:
+        if args.verbose: print("processing single csv...\n")
+        df = pd.read_csv(path, header=2, dtype=np.double)
+        id = path.name[0:3]
+        data[id] = df
+
+    if args.verbose: print(data.items())
+
+    print("data read into memory successfully")
+
+    print("modifying data...")
+
+    for id, df in data.items():
+        if args.verbose: print(f"modifying data for mouse {id}...")
+        if args.drop:
+            if args.verbose: print("dropping columns...")
+            df = drop_columns(df)
+
+        if args.pupil:
+            if args.verbose: print("adding pupil diameter columns...")
+            df = add_pupil_diameter(df, args.zscore)
+
+        if args.seconds:
+            if args.verbose: print("interpolating from frames to seconds...")
+            df = frames2seconds(df)
+
+        if args.id:
+            if args.verbose: print("adding id column...")
+            df["id"] = [id]*len(df)
+
+        if args.flatten:
+            if args.verbose: print("flattening...")
+            df = pd.DataFrame(df.values.flatten())
+
+        data[id] = df
+
+    if args.multiple and args.concatenate:
+        if args.verbose: print("concatenating dataframes...")
+        new = pd.DataFrame()
+
+        new = {}
+        for id, df in data.items():
+            if args.flatten: new[id] = df.T
+            else: new[id] = df
+
+        new = pd.concat(new.values())
+
+        if args.verbose: print(new)
+
+        data = new
+
+    if args.verbose: print(data.items())
+
+    print("data modified successfully")
+
+    print("saving data...")
+
+    if not args.output:
+        curr_dir = [dir for dir in os.listdir() if dir.startswith('output')]
+
+        if len(curr_dir):
+            latest = max([int(dir[6:]) for dir in curr_dir])+1
+        else:
+            latest = 0
+
+        args.output = os.path.join(os.getcwd(), "".join(['output', str(latest)]))
+
+        os.mkdir(args.output)
+
+    if args.multiple and args.concatenate:
+        data.to_csv(os.path.join(args.output, "_".join(["concat", str(date.today()) + ".csv"])))
+    else:
+        for id, df in data.items():
+            df.to_csv(os.path.join(args.output, "_".join([id, str(date.today()) + ".csv"])))
+
+    with open(os.path.join(args.output, "metadata.txt"), "w") as metadata:
+        if args.multiple:
+            metadata.write(f"mice:\n{ids}\n")
+        else:
+            metadata.write(f"mouse: {id}\n")
+
+        args_formatted = [f"    {key}: {value}\n" for key, value in vars(args).items()]
+        metadata.write(f"\nflags:\n")
+        for line in args_formatted:
+            metadata.write(line)
+
+    print("data saved successfully")
+
+
+def drop_columns(df) -> pd.DataFrame:
+    to_drop = ["coords","likelihood"]
+    for i in range(1,50):
+        to_drop.append(".".join(["likelihood",str(i)]))
+    return df.drop(columns=to_drop)
+
+
+def add_pupil_diameter(df, z_normalize = True) -> pd.DataFrame:
+    columns = df.columns
+    horizontal = ['x.48', 'y.48', 'x.49', 'y.49']
+    vertical = ['x.46', 'y.46' 'x.47', 'y.47']
+    temp = []
+    for orientation_columns, orientation_name in zip([horizontal, vertical], ["pupil_hor_diameter", "pupil_ver_diameter"]):
+        for col in orientation_columns:
+            if col not in columns:
+                print(f"columns for {orientation_name} calculation not found")
+                return df
+
+        for _, row in df.iterrows():
+            diameter = distance.euclidean([row[orientation_columns[0]], row[orientation_columns[1]]],
+                                          [row[orientation_columns[2]], row[orientation_columns[3]]])
+            temp.append(diameter)
+
+        if z_normalize:
+            temp = zscore(temp)
+
+        df[orientation_name] = temp
+
+    return df
+
+
+def frames2seconds(df) -> pd.DataFrame:
+    frames = []
+
+    start = 0
+    end = 1
+    fps = 30
+
+    while end < len(df)//30:
+
+        frame = df.iloc[start*fps:end*fps,:].mean(axis=0)
+        frames.append(frame.T)
+        start += 1
+        end = start + 1
+
+    return pd.DataFrame(frames)
+
+
+"""
+
+#to select the three columns associated with each keypoint - full keypoint list 
+featureData = pd.DataFrame()
+keypoints = ['headbar_ant', 'headbar_post','posthole','tail_ant','tail_post','tail_mid',
+             'paw_postL','paw_antR','paw_antL','digit_aL2', 'digit_aL3','digit_aL4',
+             'digit_aL5', 'digit_aR2','digit_aR3','digit_aR4','digit_aR5','elbow_L',
+             'body_antDor','body_postMax','body_dor','body_post','body_postVent',
+             'mouth_latL','mouth_latR','mouth_dor','mouth_vent','mouth_open','salivadrop',
+             'whisk_dor','whisk_venti','armR','armL','chest','ear_antDor','ear_antVent',
+             'ear_postMax','ear_dor','ear_vent','snoutL','snoutR','snoutTip','eye_ant',
+             'eye_post','eye_dor','eye_vent','pupil_dor','pupil_vent','pupil_ant','pupil_post']
+
+for keypoint in keypoints: 
+    colNames = data.columns[data.columns.str.contains(pat = keypoint)]
+    featureData[keypoint] = pd.concat([data[colNames[0]][1:],data[colNames[1]][1:]])#got rid of X
+
+featureData = featureData.astype(np.float32)
+print(featureData)
+
+#Creating labels
+
+genotypes = [1,1,0,0,0,1,1,1,0,1]
+
+for mouse,genotype in zip(data.values(),genotypes):
+    mouse['label'] = [genotype]*len(mouse)
+
+#say 0 = WT or 1= Het - add genotype in numerical order - this will create for every single data frame of our data in the dictionary (data) a labeled column
+
+#Section 3: LED shock detection engineering (in progress...)
+
+#New code starts here 
+mice =['635','639', '697']
+to_drop = ["coords","likelihood"]
+for i in range(1,50):
+    to_drop.append(".".join(["likelihood",str(i)]))
+
+dir = os.getcwd() 
+folder = 'raw_timings'
+files = os.listdir(os.path.join(dir,folder))
+h5s = [file for file in files if file.endswith(".h5")]
+csvs = [file for file in files if file.endswith(".csv")]
+
+data = {} #empty array {} = dictionary 
+for h5, csv in zip(h5s,csvs):
+    id_ = h5.split('.')[0]
+    if id_ in mice: 
+        keypoints = pd.read_csv(os.path.join(dir,folder,csv), header = 2)
+        #keypoints.drop(to_drop, inplace = True)
+        temp = []
+        for index,row in keypoints.iterrows(): 
+            diameter = distance.euclidean([row['x.48'],row['y.48']],
+                               [row['x.49'],row['y.49']]
+                               )
+            temp.append(diameter) 
+        keypoints['pupil_hor_diameter'] = zscore(temp)
+        temp2 = []
+        for index,row in keypoints.iterrows(): 
+            diameter = distance.euclidean([row['x.46'],row['y.46']],
+                               [row['x.47'],row['y.47']]
+                               )
+            temp2.append(diameter) 
+        keypoints['pupil_ver_diameter'] = zscore(temp2)
+        timings = pd.read_hdf(os.path.join(dir,folder,h5)) 
+        data[id_] = (timings, keypoints)
+
+
+#To get rid of outliers 
+temp = data['639'][1]['pupil_hor_diameter']
+max_ = temp.idxmax()
+temp[max_]
+
+data['639'][1].iloc[max_, 151] = 0 #119. 71 was an outlier that we set it to 0 to not affect our calculations 
+
+#maximm pupil graph for horizontal diameter - with legend and other plots with legend
+#Calculating peaks
+for id_, mouse in data.items():
+    maxs = []
+    timings, keypoints = mouse
+    peaks,_ = find_peaks(timings['LED_1_RAW'], height = 200, distance = 45*30)
+    len(peaks)
+    peaks = peaks[:-1]
+    peaks = peaks[1:]
+    print(peaks)
+
+"""
+
+if __name__ == "__main__":
+    main()
